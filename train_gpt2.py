@@ -206,16 +206,19 @@ num_return_sequences = 5
 max_length = 30
 
 import time
-torch.mps.empty_cache()
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
 elif hasattr(torch.backends,"mps") and torch.backends.mps.is_available():
     device = "mps"
+    torch.mps.empty_cache()
 
 torch.manual_seed(1337)
 if torch.mps.is_available():
     torch.mps.manual_seed(1337)
+elif torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 print(f"using device:{device}")
 model = GPT.from_pretrained('gpt2')
@@ -241,17 +244,23 @@ for i in range(50):
         
     loss.backward()
     optimizer.step()
-    torch.mps.synchronize()
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
     t1 = time.time()
     d1 = (t1 -t0) * 1000 
     tokens_per_sec = (train_loader.B * train_loader.T)/ (t1 - t0)
     print(f"Step {i} loss: {loss.item()}, dt: {d1:.2}ms, tok/sec: {tokens_per_sec}")
 
 
-import sys; sys.exit(  0)
+import sys; sys.exit(0)
 
 torch.manual_seed(42)
-torch.mps.manual_seed(42)
+if device == "mps":
+    torch.mps.manual_seed(42)
+elif device == "cuda":
+    torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
     with torch.no_grad():
         logits = model(x)
