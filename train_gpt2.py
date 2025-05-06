@@ -6,6 +6,7 @@ from torch.nn import functional as F
 import tiktoken
 import inspect
 import os
+import time
 
 class CausalSelfAttention(nn.Module):
     def __init__(self,config):
@@ -230,6 +231,9 @@ class DataloaderLite:
         assert len(shards) >0 , f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
@@ -256,10 +260,9 @@ class DataloaderLite:
             self.current_position = B * T * self.process_rank
         return x,y
 
-num_return_sequences = 5
-max_length = 30
 
-import time
+
+
 
 device = "cpu"
 if torch.cuda.is_available():
@@ -304,8 +307,10 @@ model = GPT.from_pretrained('gpt2')
 model.eval()
 model.to(device)
 
+enc = tiktoken.get_encoding('gpt2')
+
 total_batch_size = 524288
-B = 4
+B = 64
 T = 1024
 assert total_batch_size % (B *T) == 0, "make sure total_batch_size is devisible by B * T"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -314,7 +319,9 @@ if master_process:
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
 
-train_loader = DataloaderLite(B = B, T = T,process_rank = ddp_rank ,num_process=ddp_world_size)
+train_loader = DataloaderLite(B = B, T = T,process_rank = ddp_rank ,num_process=ddp_world_size,split="train")
+val_loader = DataloaderLite(B = B, T = T,process_rank = ddp_rank ,num_process=ddp_world_size,split="val")
+
 torch.set_float32_matmul_precision('high')
 
 model = GPT(GPTConfig(vocab_size= 50304))
@@ -327,8 +334,8 @@ raw_model = model.module if ddp else model
 
 max_lr  = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
 def get_lr(it):
     if it <warmup_steps:
         return max_lr * (it+1) /warmup_steps
@@ -345,6 +352,52 @@ optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate = 6
 
 for step in range(max_steps):
     t0 = time.time()
+    if step %100 ==0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x,y = val_loader.next_batch()
+                x,y = x.to(device),y.to(device)
+                with torch.autocast(device_type=device,dtype=torch.bfloat16):
+                    logits,loss = model(x,y)
+                loss = loss/val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            dist.all_reduce(val_loss_accum,op = dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+    if step >0 and step %100 ==0 :
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello : I'm a language model, ")
+        tokens = torch.tensor(tokens,dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences,1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device = device)
+        sample_rng.manual(42+ddp_rank)
+        while xgen.size(1) < max_length:
+            with torch.no_grad():
+                logits,loss = model(xgen)
+
+                logits = logits[:,-1,:]
+                probs = F.softmax(logits,dim = -1)
+                topk_probs,topk_indices = torch.topk(probs,50,dim = -1)
+                ix = torch.multinomial(topk_probs,1,generator=sample_rng)
+                xcol = torch.gather(topk_indices,-1,ix)
+                xgen = torch.cat((xgen,xcol),dim = 1)
+            for i in range(num_return_sequences):
+                tokens = xgen[i,:max_length].tolist()
+                decoded = enc.decode(tokens)
+                print(f"rank {ddp_rank} sample{i}: {decoded}")
+
+
+
+    model.train()
     optimizer.zero_grad()
     for micro_step in range(grad_accum_steps):
         x,y = train_loader.next_batch()
