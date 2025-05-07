@@ -7,6 +7,8 @@ import tiktoken
 import inspect
 import os
 import time
+from hellaswag import render_example, iteration_examples
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self,config):
@@ -260,7 +262,19 @@ class DataloaderLite:
             self.current_position = B * T * self.process_rank
         return x,y
 
-
+def get_most_likely_row(tokens, mask,logits):
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[...,:-1, :]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits,flat_shift_tokens,reduction = 'none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    shift_mask = (mask[..., 1:]).contiguous()
+    masked_shift_losses = shift_losses * shift_mask 
+    sum_loss = masked_shift_losses.sum(dim = 1)
+    avg_loss = sum_loss /shift_mask.sum(dim = 1)
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 
 
@@ -326,7 +340,10 @@ torch.set_float32_matmul_precision('high')
 
 model = GPT(GPTConfig(vocab_size= 50304))
 model.to(device)
-model = torch.compile(model)
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+if use_compile:
+    model = torch.compile(model)
+
 if ddp:
     model = DDP(model,device_ids = [ddp_local_rank])
 raw_model = model.module if ddp else model
@@ -350,9 +367,16 @@ def get_lr(it):
 # optimizer = torch.optim.AdamW(model.parameters(),lr = 3e-4,betas= (0.9,0.95), eps = 1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, device = device)
 
+log_dir = "log"
+os.makedirs(log_dir, exist_ok= True)
+log_file = os.parh.joi(log_dir, f"log.txt")
+with open(log_file, "w") as f:
+    pass
+
 for step in range(max_steps):
     t0 = time.time()
-    if step %100 ==0:
+    last_step = (step == max_steps -1)
+    if step %250 or last_step ==0:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -369,8 +393,39 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum,op = dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
 
-    if step >0 and step %100 ==0 :
+    # for evaluating helloswag
+    if (step % 250 ==0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i , example  in enumerate(iteration_examples("val")):
+            if i % ddp_world_size != ddp_rank:
+                continue
+            _, tokens,mask, label = render_example(example)
+            tokens = tokens.to(device)
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits,loss = model(tokens)
+                pred_normal = get_most_likely_row(tokens,mask,logits)
+            num_total+= 1
+            num_correct_norm += int(pred_normal== label)
+
+        if ddp:
+            num_total = torch.tensor(num_total, dtype= torch.bfloat16, device= device)
+            num_correct_norm = torch.tensor(num_correct_norm,dtype=torch.long, device=device)
+            dist.all_reduce(num_total, op = dist.ReduceOp.SUM)
+            dist.all_reduce(num_correct_norm, op = dist.ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HelloSwag Accuracy: {num_correct_norm } / {num_total} = {acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+
+    if ((step >0 and step %250 ==0) or last_step) and (not use_compile) :
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -382,7 +437,8 @@ for step in range(max_steps):
         sample_rng.manual(42+ddp_rank)
         while xgen.size(1) < max_length:
             with torch.no_grad():
-                logits,loss = model(xgen)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits,loss = model(xgen)
 
                 logits = logits[:,-1,:]
                 probs = F.softmax(logits,dim = -1)
@@ -399,13 +455,14 @@ for step in range(max_steps):
 
     model.train()
     optimizer.zero_grad()
+    loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x,y = train_loader.next_batch()
         x,y = x.to(device),y.to(device)
         with torch.autocast(device_type = device, dtype = torch.bfloat16):
             logits,loss = model(x,y)
         loss = loss / grad_accum_steps
-        loss_accum = loss.detach()
+        loss_accum += loss.detach()
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)
         loss.backward()
@@ -425,30 +482,9 @@ for step in range(max_steps):
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size)/ (t1 - t0)
     if master_process:
         print(f"Step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm :{norm:.4f} | dt: {d1:.2}ms | tok/sec: {tokens_per_sec}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
 
-
-import sys; sys.exit(0)
-
-torch.manual_seed(42)
-if device == "mps":
-    torch.mps.manual_seed(42)
-elif device == "cuda":
-    torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x)
-        logits = logits[:, -1, :]
-
-        probs = F.softmax(logits,dim= -1)
-        topk_probs,topk_indices = torch.topk(probs,50,dim= -1)
-        ix = torch.multinomial(topk_probs,1)
-        xcol = torch.gather(topk_indices, -1,ix)
-        x = torch.cat((x,xcol),dim = 1)
-
-for i in range(num_return_sequences):
-    tokens = x[i,:max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
